@@ -4,11 +4,17 @@ import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, MutableMapping, Tuple
+from typing import Dict, List, MutableMapping, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 import pandas as pd
+import torch
+
+import math
+from scipy.special import zeta as hurwitz_zeta
+from scipy.optimize import minimize_scalar
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -25,20 +31,16 @@ DATASET_ROOT = Path(
 @dataclass
 class FamilyData:
     """
-    Aggregated container for all files that belong to a single network family.
+    Container that bundles every artifact that belongs to one family.
 
     Attributes
     ----------
     graphs : Dict[str, nx.Graph]
-        Mapping where each key is the network identifier (e.g. 'A') and the
-        value is an undirected graph containing |V| nodes and |E| edges.
+        Loaded adjacency information for each network variant (A/B/C...).
     annotations : Dict[str, Dict[str, List[str]]]
-        Mapping where annotations[network][node] stores a list of functional
-        orthology (FO) terms associated with that node.
+        FO (functional orthology) labels keyed by network then node id.
     similarities : Dict[Tuple[str, str], pd.DataFrame]
-        The dataframe for a pair (u, v) has shape (m, 3) and contains the
-        columns ['source_node', 'target_node', 'score'] describing m fuzzy
-        similarity scores between nodes of the two networks.
+        Cross-network similarity tables keyed by the ordered pair (src, tgt).
     """
 
     graphs: Dict[str, nx.Graph]
@@ -46,20 +48,16 @@ class FamilyData:
     similarities: Dict[Tuple[str, str], pd.DataFrame]
 
 
-def discover_dataset_structure(dataset_root: Path = DATASET_ROOT,) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
+def discover_dataset_structure(
+    dataset_root: Path = DATASET_ROOT,
+) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
     """
-    Build a nested dictionary that mirrors the on-disk hierarchy.
-
-    Parameters
-    ----------
-    dataset_root : Path
-        Absolute directory that contains the top-level benchmark folders.
+    Recursively enumerate the benchmark hierarchy.
 
     Returns
     -------
     Dict[str, Dict[str, Dict[str, List[str]]]]
-        structure[suite][category][family] -> sorted list of file names
-        contained in that family directory.
+        structure[suite][category][family] -> list of files.
     """
 
     structure: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
@@ -85,17 +83,7 @@ def discover_dataset_structure(dataset_root: Path = DATASET_ROOT,) -> Dict[str, 
 
 def summarize_structure(structure: Dict[str, Dict[str, Dict[str, List[str]]]]) -> str:
     """
-    Convert the nested structure dictionary into a human-readable summary.
-
-    Parameters
-    ----------
-    structure : Dict[str, Dict[str, Dict[str, List[str]]]]
-        Output of :func:`discover_dataset_structure`.
-
-    Returns
-    -------
-    str
-        Multi-line description of counts for suites, categories, and families.
+    Convert the nested structure dictionary into a readable summary.
     """
 
     lines: List[str] = []
@@ -114,17 +102,7 @@ def summarize_structure(structure: Dict[str, Dict[str, Dict[str, List[str]]]]) -
 
 def read_network_file(file_path: Path) -> nx.Graph:
     """
-    Load a .net file into a NetworkX graph.
-
-    Parameters
-    ----------
-    file_path : Path
-        Absolute path to a '.net' file that stores an edge list.
-
-    Returns
-    -------
-    nx.Graph
-        Undirected graph with |V| nodes and |E| edges represented in the file.
+    Load a `.net` edge list into a NetworkX graph.
     """
 
     graph = nx.Graph(name=file_path.stem)
@@ -141,18 +119,7 @@ def read_network_file(file_path: Path) -> nx.Graph:
 
 def read_functional_annotations(file_path: Path) -> Dict[str, List[str]]:
     """
-    Load a .fo file into a node -> FO terms mapping.
-
-    Parameters
-    ----------
-    file_path : Path
-        Absolute path to a '.fo' file (two-tab-separated columns).
-
-    Returns
-    -------
-    Dict[str, List[str]]
-        Dictionary where each value is a list of FO terms (shape (k_i,)) that
-        belongs to node i. The list length varies per node.
+    Load `.fo` files (node -> FO term) into a dictionary.
     """
 
     annotations: MutableMapping[str, List[str]] = defaultdict(list)
@@ -168,19 +135,7 @@ def read_functional_annotations(file_path: Path) -> Dict[str, List[str]]:
 
 def read_similarity_file(file_path: Path) -> pd.DataFrame:
     """
-    Load a .sim file into a pandas DataFrame.
-
-    Parameters
-    ----------
-    file_path : Path
-        Absolute path to a '.sim' file containing node pairs and scores.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with shape (m, 3) and columns
-        ['source_node', 'target_node', 'score'] where m is the number of
-        cross-network node comparisons present in the file.
+    Load `.sim` files into a pandas DataFrame.
     """
 
     dataframe = pd.read_csv(
@@ -196,18 +151,7 @@ def read_similarity_file(file_path: Path) -> pd.DataFrame:
 
 def load_family_data(family_dir: Path) -> FamilyData:
     """
-    Read every .net, .fo, and .sim file inside a family directory.
-
-    Parameters
-    ----------
-    family_dir : Path
-        Absolute directory that contains files for a specific family.
-
-    Returns
-    -------
-    FamilyData
-        Container populated with networks, annotations, and similarities for
-        the requested family.
+    Load every network/annotation/similarity file stored inside a family folder.
     """
 
     graphs: Dict[str, nx.Graph] = {}
@@ -246,23 +190,13 @@ def load_family_data(family_dir: Path) -> FamilyData:
     return FamilyData(graphs=graphs, annotations=annotations, similarities=similarities)
 
 
-def plot_degree_distribution(graph: nx.Graph, network_name: str, bins: int = 50,) -> plt.Figure:
+def plot_degree_distribution(
+    graph: nx.Graph,
+    network_name: str,
+    bins: int = 50,
+) -> plt.Figure:
     """
-    Create a histogram of node degrees for a given network.
-
-    Parameters
-    ----------
-    graph : nx.Graph
-        NetworkX graph whose degrees will be summarized.
-    network_name : str
-        Identifier used in the plot title.
-    bins : int
-        Number of histogram bins (shape parameter for the histogram vector).
-
-    Returns
-    -------
-    plt.Figure
-        Figure object containing the histogram visualization.
+    Plot a histogram of degrees for diagnostic purposes.
     """
 
     degrees: List[int] = [degree for _, degree in graph.degree()]
@@ -276,23 +210,13 @@ def plot_degree_distribution(graph: nx.Graph, network_name: str, bins: int = 50,
     return fig
 
 
-def plot_annotation_histogram(annotations: Dict[str, List[str]], network_name: str, top_k_terms: int = 20,) -> plt.Figure:
+def plot_annotation_histogram(
+    annotations: Dict[str, List[str]],
+    network_name: str,
+    top_k_terms: int = 20,
+) -> plt.Figure:
     """
-    Plot the frequency of the top FO terms for a single network.
-
-    Parameters
-    ----------
-    annotations : Dict[str, List[str]]
-        Mapping node -> FO terms (each list has shape (k_i,)).
-    network_name : str
-        Identifier used in the plot title.
-    top_k_terms : int
-        Number of most frequent FO terms to display.
-
-    Returns
-    -------
-    plt.Figure
-        Figure object containing a horizontal bar chart.
+    Visualize the most frequent FO terms within a network.
     """
 
     counter = Counter(term for values in annotations.values() for term in values)
@@ -309,45 +233,6 @@ def plot_annotation_histogram(annotations: Dict[str, List[str]], network_name: s
     return fig
 
 
-def plot_similarity_heatmap(similarity_df: pd.DataFrame, pair_label: str, top_k_pairs: int = 200,) -> plt.Figure:
-    """
-    Plot a heatmap for the highest-scoring subset of similarity pairs.
-
-    Parameters
-    ----------
-    similarity_df : pd.DataFrame
-        DataFrame shaped (m, 3) with the columns
-        ['source_node', 'target_node', 'score'].
-    pair_label : str
-        Identifier for the pair, e.g. 'A-B'.
-    top_k_pairs : int
-        Number of rows to keep before pivoting into a matrix.
-
-    Returns
-    -------
-    plt.Figure
-        Figure object containing the similarity heatmap.
-    """
-
-    subset = similarity_df.nlargest(top_k_pairs, "score")
-    pivot = subset.pivot(
-        index="source_node", columns="target_node", values="score"
-    ).fillna(0.0)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    heatmap = ax.imshow(pivot.values, aspect="auto", cmap="viridis")
-    ax.set_title(f"{pair_label}: top {top_k_pairs} similarity scores")
-    ax.set_xlabel("Target node")
-    ax.set_ylabel("Source node")
-    fig.colorbar(heatmap, ax=ax, fraction=0.025, pad=0.02, label="Score")
-    ax.set_xticks(range(len(pivot.columns)))
-    ax.set_xticklabels(pivot.columns, rotation=90, fontsize=6)
-    ax.set_yticks(range(len(pivot.index)))
-    ax.set_yticklabels(pivot.index, fontsize=6)
-    fig.tight_layout()
-    return fig
-
-
 def visualize_family(
     family_data: FamilyData,
     similarity_pair: Tuple[str, str] = ("A", "B"),
@@ -356,27 +241,7 @@ def visualize_family(
     top_similarity_pairs: int = 250,
 ) -> Dict[str, plt.Figure]:
     """
-    Generate diagnostic plots for the requested family.
-
-    Parameters
-    ----------
-    family_data : FamilyData
-        Container returned by :func:`load_family_data`.
-    similarity_pair : Tuple[str, str]
-        Network identifiers for the similarity heatmap.
-    degree_bins : int
-        Number of bins for degree histograms.
-    top_annotation_terms : int
-        How many FO terms to display per network.
-    top_similarity_pairs : int
-        Number of rows retained from the similarity dataframe.
-
-    Returns
-    -------
-    Dict[str, plt.Figure]
-        Mapping where the key describes the visualization and the value is the
-        Matplotlib Figure object. Figures are not saved to disk to respect the
-        user's workspace constraints.
+    Generate a standard set of exploratory plots for one family directory.
     """
 
     figures: Dict[str, plt.Figure] = {}
@@ -411,30 +276,439 @@ def visualize_family(
     return figures
 
 
+def get_dist_matrix(raph: nx.Graph,node_order: Sequence[str] | None = None) -> Tuple[torch.Tensor, List[str]]:
+    """
+    Compute the all-pairs shortest path distances for the requested graph.
+
+    Parameters
+    ----------
+    graph : nx.Graph
+        Input network (treated as undirected and unweighted).
+    node_order : Sequence[str] | None
+        Optional deterministic node ordering. Defaults to sorted node ids.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, List[str]]
+        Distance matrix with shape (n, n) and the node order that was used.
+    """
+
+    if node_order is None:
+        node_order = sorted(graph.nodes())
+    node_order = list(node_order)
+    if not node_order:
+        return torch.zeros((0, 0), dtype=torch.float32), []
+
+    adjacency = nx.to_numpy_array(
+        graph,
+        nodelist=node_order,
+        dtype=np.float32,
+        weight=None,
+    )
+    adjacency = torch.from_numpy(adjacency.astype(np.float32, copy=False))
+
+    n = adjacency.shape[0]
+    dist_matrix = torch.full((n, n), float("inf"), dtype=torch.float32)
+    diag_idx = torch.arange(n)
+    dist_matrix[diag_idx, diag_idx] = 0.0
+
+    edge_mask = adjacency > 0.0
+    if edge_mask.any():
+        dist_matrix[edge_mask] = adjacency[edge_mask]
+
+    for k in range(n):
+        dist_matrix = torch.minimum(
+            dist_matrix,
+            dist_matrix[:, k].unsqueeze(1) + dist_matrix[k].unsqueeze(0),
+        )
+
+    if torch.isinf(dist_matrix).any():
+        finite = dist_matrix[~torch.isinf(dist_matrix)]
+        fill_value = float(finite.max() * 2.0) if finite.numel() else 0.0
+        dist_matrix = torch.where(
+            torch.isinf(dist_matrix),
+            torch.full_like(dist_matrix, fill_value),
+            dist_matrix,
+        )
+    return dist_matrix, node_order
+
+
+def get_ACC(graph: nx.Graph) -> Dict[str, float]:
+    """
+    Per-node average clustering coefficient (local clustering).
+    """
+
+    return nx.clustering(graph)
+
+
+def get_ASP(graph: nx.Graph) -> Dict[str, float]:
+    """
+    Per-node average shortest-path length (within each connected component).
+    """
+
+    asp: Dict[str, float] = {}
+    for node in graph.nodes():
+        lengths = nx.single_source_shortest_path_length(graph, node)
+        if len(lengths) <= 1:
+            asp[node] = 0.0
+            continue
+        total = sum(dist for target, dist in lengths.items() if target != node)
+        asp[node] = total / max(len(lengths) - 1, 1)
+    return asp
+
+
+def get_BC(graph: nx.Graph, *, k: int | None = None, seed: int = 42) -> Dict[str, float]:
+    """
+    Betweenness centrality for every node (approximate if k is provided).
+    """
+
+    return nx.betweenness_centrality(graph, k=k, normalized=True, seed=seed)
+
+
+def _largest_component(graph: nx.Graph) -> nx.Graph:
+    """
+    Internal helper that extracts the largest connected component copy.
+    """
+
+    if graph.number_of_nodes() == 0:
+        return graph.copy()
+    if nx.is_connected(graph):
+        return graph.copy()
+    component_nodes = max(nx.connected_components(graph), key=len)
+    return graph.subgraph(component_nodes).copy()
+
+
+def get_small_worldness(graph: nx.Graph, *, seed: int = 42, n_iter: int = 8,) -> Tuple[float, bool]:
+    """
+    Estimate small-world-ness using the sigma statistic.
+
+    Returns
+    -------
+    Tuple[float, bool]
+        sigma value and whether sigma > 1 (classic small-world criterion).
+    """
+
+    core = _largest_component(graph)
+    n = core.number_of_nodes()
+    m = core.number_of_edges()
+    if n < 3 or m == 0:
+        return float("nan"), False
+
+    clustering = nx.average_clustering(core)
+    path_length = nx.average_shortest_path_length(core)
+
+    rng = np.random.default_rng(seed)
+    sigma_samples: List[float] = []
+    for _ in range(n_iter):
+        LOGGER.info("Iteration: %s", _)
+        random_graph = nx.gnm_random_graph(
+            n,
+            m,
+            seed=int(rng.integers(0, 1_000_000)),
+        )
+        if random_graph.number_of_edges() == 0 or not nx.is_connected(random_graph):
+            random_graph = _largest_component(random_graph)
+        rand_clustering = nx.average_clustering(random_graph)
+        rand_path = (
+            nx.average_shortest_path_length(random_graph)
+            if random_graph.number_of_edges() > 0
+            else float("inf")
+        )
+        if rand_clustering == 0 or rand_path == float("inf"):
+            continue
+        sigma_samples.append((clustering / rand_clustering) / (path_length / rand_path))
+
+    if not sigma_samples:
+        return float("nan"), False
+    sigma_value = float(np.mean(sigma_samples))
+    return sigma_value, sigma_value > 1.0
+
+
+def get_clustering(graph: nx.Graph, *, seed: int = 42, n_iter: int = 8) -> Tuple[float, bool]:
+    """
+    Compare clustering coefficient against Erdos-Renyi baselines.
+
+    Returns
+    -------
+    Tuple[float, bool]
+        Ratio C / C_rand and a boolean indicating if the network is more
+        clustered than random graphs (ratio > 1).
+    """
+
+    core = _largest_component(graph)
+    n = core.number_of_nodes()
+    m = core.number_of_edges()
+    if n < 3 or m == 0:
+        return float("nan"), False
+
+    clustering = nx.average_clustering(core)
+
+    rng = np.random.default_rng(seed)
+    ratios: List[float] = []
+    for _ in range(n_iter):
+        random_graph = nx.gnm_random_graph(
+            n,
+            m,
+            seed=int(rng.integers(0, 1_000_000)),
+        )
+        rand_clustering = nx.average_clustering(random_graph)
+        if rand_clustering == 0:
+            continue
+        ratios.append(clustering / rand_clustering)
+
+    if not ratios:
+        return float("nan"), False
+    ratio = float(np.mean(ratios))
+    return ratio, ratio > 1.0
+
+
+def get_scale_free_ness(graph: nx.Graph) -> Tuple[float, bool]:
+    """
+    Fit the degree distribution on a log-log scale to check for power-law tails.
+
+    Returns
+    -------
+    Tuple[float, bool]
+        The gamma value.
+        r^2 goodness-of-fit value and a boolean indicating whether the fitted
+        exponent falls inside the canonical (2, 3) range with r^2 >= 0.8.
+    """
+
+    degrees = torch.tensor([deg for _, deg in graph.degree()], dtype=torch.float32)
+    degrees = degrees[degrees > 0]
+    if degrees.numel() < 3:
+        return float("nan"), False
+
+    unique, counts = torch.unique(degrees, return_counts=True)
+    mask = unique >= 1
+    unique = unique[mask]
+    counts = counts[mask].float()
+    if unique.numel() < 2:
+        return float("nan"), False
+
+    x = torch.log(unique)
+    y = torch.log(counts)
+    x_mean = x.mean()
+    y_mean = y.mean()
+
+    denom = torch.sum((x - x_mean) ** 2)
+    if denom == 0:
+        return float("nan"), False
+    slope = torch.sum((x - x_mean) * (y - y_mean)) / denom
+    intercept = y_mean - slope * x_mean
+    y_pred = slope * x + intercept
+    ss_res = torch.sum((y - y_pred) ** 2)
+    ss_tot = torch.sum((y - y_mean) ** 2)
+    if ss_tot == 0:
+        return float("nan"), False
+    r_squared = 1.0 - ss_res / ss_tot
+    gamma = -float(slope.item())
+    r_value = float(r_squared.item())
+    is_scale_free = 2.0 <= gamma <= 3.0 and r_value >= 0.8
+    return gamma, r_value, is_scale_free
+
+
+def _degrees_positive(graph: nx.Graph) -> np.ndarray:
+    degs = np.array([d for _, d in graph.degree()], dtype=np.int64)
+    return degs[degs > 0]
+
+def _neg_log_likelihood_discrete(alpha: float, data: np.ndarray, kmin: int) -> float:
+    """
+    Negative log-likelihood for discrete power-law P(k) = k^{-alpha} / zeta(alpha, kmin).
+    We return +inf for invalid alpha values.
+    """
+    if alpha <= 1.0:
+        return float("inf")
+    try:
+        z = hurwitz_zeta(alpha, kmin)
+        if not np.isfinite(z) or z <= 0.0:
+            return float("inf")
+        n = data.size
+        s = np.sum(np.log(data))
+        # negative log-likelihood:
+        return n * math.log(z) + alpha * float(s)
+    except Exception:
+        return float("inf")
+
+def _mle_alpha_discrete(data: np.ndarray, kmin: int, alpha_max: float = 10.0) -> float:
+    """
+    Find MLE alpha for discrete power-law data >= kmin by numeric optimization.
+    Uses bounded scalar minimization on alpha in (1+eps, alpha_max).
+    Returns estimated alpha (float).
+    """
+    # ensure data contains only integers >= kmin
+    tail = data[data >= kmin]
+    if tail.size == 0:
+        return float("nan")
+
+    # objective: minimize negative log-likelihood
+    res = minimize_scalar(
+        lambda a: _neg_log_likelihood_discrete(a, tail, kmin),
+        bounds=(1.0001, alpha_max),
+        method="bounded",
+        options={"xatol": 1e-6},
+    )
+    if not res.success:
+        return float("nan")
+    return float(res.x)
+
+def _ks_statistic_discrete(data: np.ndarray, kmin: int, alpha: float, kmax: int = None) -> float:
+    """
+    Compute KS statistic between empirical CDF of data>=kmin and the discrete power-law CDF with given alpha.
+    kmax controls truncation for the theoretical CDF sum; default is max(data).
+    """
+    tail = data[data >= kmin]
+    if tail.size == 0:
+        return float("nan")
+    if kmax is None:
+        kmax = int(tail.max())
+
+    # empirical CDF at integer k: S(k) = fraction of tail values >= k
+    # But Clauset uses CDF F(k) = P(X <= k) usually; KS uses sup |S_emp - S_model|
+    # We'll compute empirical CDF F_emp(k) = fraction <= k for k in [kmin..kmax]
+    ks = np.arange(kmin, kmax + 1)
+    counts = np.array([np.sum(tail <= k) for k in ks], dtype=float)
+    F_emp = counts / tail.size
+
+    # theoretical pmf p(k) and cdf F_model(k)
+    try:
+        z = hurwitz_zeta(alpha, kmin)
+        pk = ks.astype(np.float64) ** (-alpha) / float(z)
+    except Exception:
+        return float("inf")
+    F_model = np.cumsum(pk)
+    # Make sure model cdf has same support; if we truncated at kmax, renormalize if needed:
+    # but we want the model CDF on ks; so it's fine.
+
+    # KS statistic (sup |F_emp - F_model|)
+    ks_extended = min(kmax, ks[-1])
+    # match lengths
+    if F_model.size != F_emp.size:
+        # fallback: interpolate model onto ks positions (shouldn't happen)
+        F_model = F_model[:F_emp.size]
+    D = np.max(np.abs(F_emp - F_model))
+    return float(D)
+
+def _sample_discrete_powerlaw(alpha: float, kmin: int, size: int, kmax: int) -> np.ndarray:
+    """
+    Sample 'size' integers from discrete power-law P(k) ~ k^{-alpha} for k in [kmin..kmax].
+    Uses inverse transform with precomputed cdf (truncated at kmax).
+    """
+    ks = np.arange(kmin, kmax + 1)
+    z = np.sum(ks.astype(np.float64) ** (-alpha))
+    pmf = ks.astype(np.float64) ** (-alpha) / z
+    cdf = np.cumsum(pmf)
+    u = np.random.rand(size)
+    # searchsorted returns indices in [0..len(ks)-1]
+    inds = np.searchsorted(cdf, u, side="right")
+    samples = ks[np.clip(inds, 0, len(ks) - 1)]
+    return samples
+
+
+def get_scale_free_ness_clauset(
+    graph: nx.Graph, *,
+    n_sims: int = 500,
+    alpha_max: float = 10.0,
+    min_tail: int = 50,
+    rng_seed: int = 42
+) -> Tuple[float, int, float, bool]:
+    """
+    Clauset et al. (2009) - rigorous discrete power-law fit for degree distribution.
+
+    Returns
+    -------
+    Tuple[gamma, kmin, p_value, is_plausible]
+      gamma: fitted power-law exponent alpha (so degree PDF ~ k^{-gamma} for k >= kmin)
+      kmin: selected minimum degree for tail
+      p_value: Monte-Carlo p-value for goodness-of-fit (higher means power-law is plausible)
+      is_plausible: boolean (p_value > 0.1) per Clauset's recommendation
+    Notes
+    -----
+    - This implements Clauset's algorithm: for each candidate kmin, find MLE for alpha,
+      compute KS statistic between empirical tail and fitted discrete power-law,
+      choose kmin minimizing KS. Then perform Monte-Carlo to get p-value.
+    - n_sims controls Monte-Carlo repetitions (costly for large graphs).
+    - min_tail: minimal number of points in tail to consider a candidate kmin.
+    """
+    rng = np.random.default_rng(rng_seed)
+
+    degs = _degrees_positive(graph)
+    if degs.size < 3:
+        return float("nan"), -1, float("nan"), False
+
+    unique_ks = np.unique(degs)
+    # candidate kmin values: unique degrees, but need enough tail samples
+    candidates = []
+    for k in unique_ks:
+        tail_count = np.sum(degs >= k)
+        if tail_count >= min_tail:
+            candidates.append(int(k))
+    if not candidates:
+        # try relaxing min_tail
+        candidates = [int(k) for k in unique_ks if np.sum(degs >= k) >= 3]
+        if not candidates:
+            return float("nan"), -1, float("nan"), False
+
+    best = {"kmin": None, "alpha": None, "ks": np.inf, "n_tail": 0}
+
+    kmax_obs = int(degs.max())
+
+    # 1) scan kmin
+    for kmin in candidates:
+        alpha_hat = _mle_alpha_discrete(degs, kmin, alpha_max=alpha_max)
+        if not np.isfinite(alpha_hat):
+            continue
+        ks_stat = _ks_statistic_discrete(degs, kmin, alpha_hat, kmax=kmax_obs)
+        n_tail = int(np.sum(degs >= kmin))
+        if ks_stat < best["ks"]:
+            best.update({"kmin": int(kmin), "alpha": float(alpha_hat), "ks": float(ks_stat), "n_tail": n_tail})
+
+    if best["kmin"] is None:
+        return float("nan"), -1, float("nan"), False
+
+    # 2) Monte-Carlo to estimate p-value
+    kmin_star = best["kmin"]
+    alpha_star = best["alpha"]
+    ks_data = best["ks"]
+    n_tail = best["n_tail"]
+
+    # To sample synthetic data, we truncate distribution at observed kmax
+    kmax = kmax_obs
+
+    larger_count = 0
+    # For reproducibility:
+    np.random.seed(rng_seed)
+
+    for i in range(n_sims):
+        # sample synthetic tail of size n_tail from fitted discrete power-law
+        synth_tail = _sample_discrete_powerlaw(alpha_star, kmin_star, n_tail, kmax)
+        # combine with empirical lower-degree values? Clauset uses only tail for KS and simulation
+        # Fit alpha_s to the synthetic tail (re-estimate)
+        alpha_s = _mle_alpha_discrete(synth_tail, kmin_star, alpha_max=alpha_max)
+        if not np.isfinite(alpha_s):
+            # treat as large KS (skip)
+            continue
+        ks_s = _ks_statistic_discrete(synth_tail, kmin_star, alpha_s, kmax=kmax)
+        if ks_s > ks_data:
+            larger_count += 1
+
+    # p-value = fraction of synthetic KS greater than empirical KS
+    p_value = larger_count / max(1, n_sims)
+    is_plausible = p_value > 0.1  # Clauset recommended threshold
+
+    gamma = float(alpha_star)
+    return gamma, kmin_star, float(p_value), bool(is_plausible)
+
+
 def main() -> None:
     """
-    Entry point that prints the dataset structure and loads one example family.
+    Entry-point for quick manual inspection.
     """
 
     LOGGER.info("Scanning dataset root at %s", DATASET_ROOT)
     structure = discover_dataset_structure()
     print(summarize_structure(structure))
 
-    sample_family = DATASET_ROOT / "2way" / "DMR" / "family1"
-    if not sample_family.exists():
-        LOGGER.error("Sample family directory %s does not exist.", sample_family)
-        return
-
-    LOGGER.info("Loading sample family from %s", sample_family)
-    family_data = load_family_data(sample_family)
-    figures = visualize_family(family_data, similarity_pair=("A", "B"))
-    LOGGER.info(
-        "Generated %d diagnostic plots. Call `.show()` or `.savefig()` on the "
-        "figure objects that the function returned to inspect them.",
-        len(figures),
-    )
-
 
 if __name__ == "__main__":
     main()
-

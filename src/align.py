@@ -1,27 +1,21 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Tuple
 
 import networkx as nx
-import numpy as np
 import torch
 from fugw.mappings import FUGW
 
-from src.evaluate import (
-    argmax_alignment,
-    edge_correctness,
-    node_correctness,
-    precision_at_k,
-    recall_at_k,
-    s3_score,
-    topk_alignment,
+from src.features import get_node_features
+from src.process import get_dist_matrix
+from src.utils import (
+    load_cached_features,
+    prepare_output_dir,
+    save_alignment_inputs,
+    save_alignment_results,
 )
-from src.features import build_fo_vocabulary, compute_node_features, standardize_pair
-from src.geometry import shortest_path_distance_matrix
-from src.process import DATASET_ROOT, FamilyData, load_family_data
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -33,186 +27,201 @@ logging.basicConfig(
 @dataclass
 class FeatureConfig:
     """
-    特征计算相关的超参数。
+    Hyper-parameters that control the feature standardization process.
     """
 
-    fo_top_k: int = 64
-    shortest_path_sample: int = 256
-    betweenness_k: int = 256
+    normalize: bool = True
+    eps: float = 1e-8
 
 
 @dataclass
 class AlignmentConfig:
     """
-    FUGW 对齐超参数。
+    Configuration for the FUGW solver.
     """
 
-    source_id: str = "A"
-    target_id: str = "B"
     alpha: float = 0.5
-    rho: float = 1.0
+    rho: float = 10
     eps: float = 1e-4
     solver: str = "sinkhorn"
     solver_params: Dict[str, Any] = field(
-        default_factory=lambda: {"tol_uot": 1e-10}
+        default_factory=lambda: {"nits_bcd": 20, "nits_uot": 1000, "tol_bcd": 1e-4,"tol_uot": 1e-10}
     )
-    device: str = "auto"
+    device: str = "cuda"
     verbose: bool = True
 
 
-def _strip_prefix(node_id: str) -> str:
-    """
-    去掉节点名的字母前缀，用于推断真值映射。
-    """
-
-    i = 0
-    while i < len(node_id) and not node_id[i].isdigit():
-        i += 1
-    return node_id[i:]
-
-
-def infer_ground_truth_by_suffix(
-    source_nodes: Sequence[str],
-    target_nodes: Sequence[str],
-) -> Dict[str, str]:
-    """
-    假定同一数字后缀的节点为真值对应（NAPAbench 常见约定）。
-    """
-
-    tgt_lookup = {_strip_prefix(t): t for t in target_nodes}
-    mapping: Dict[str, str] = {}
-    for s in source_nodes:
-        candidate = tgt_lookup.get(_strip_prefix(s))
-        if candidate:
-            mapping[s] = candidate
-    return mapping
-
-
-def _prepare_features_and_geometry(
-    source_graph: nx.Graph,
-    target_graph: nx.Graph,
-    source_annotations: Dict[str, List[str]],
-    target_annotations: Dict[str, List[str]],
-    feature_config: FeatureConfig,
-    feature_weights: Optional[np.ndarray] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    List[str],
-    List[str],
-    np.ndarray,
-    List[str],
-]:
-    """
-    生成特征张量、几何矩阵与节点顺序。
-
-    Returns
-    -------
-    (
-      source_features, target_features,
-      source_geometry, target_geometry,
-      source_nodes, target_nodes,
-      applied_weights, feature_names
-    )
-    """
-
-    fo_vocab = build_fo_vocabulary(
-        [source_annotations, target_annotations],
-        top_k=feature_config.fo_top_k,
-    )
-
-    src_feats, feat_names, src_nodes = compute_node_features(
-        graph=source_graph,
-        annotations=source_annotations,
-        fo_vocab=fo_vocab,
-        shortest_path_sample=feature_config.shortest_path_sample,
-        betweenness_k=feature_config.betweenness_k,
-    )
-    tgt_feats, _, tgt_nodes = compute_node_features(
-        graph=target_graph,
-        annotations=target_annotations,
-        fo_vocab=fo_vocab,
-        shortest_path_sample=feature_config.shortest_path_sample,
-        betweenness_k=feature_config.betweenness_k,
-    )
-
-    src_norm, tgt_norm, applied_weights = standardize_pair(
-        source_features=src_feats,
-        target_features=tgt_feats,
-        weights=feature_weights,
-    )
-
-    src_geom = shortest_path_distance_matrix(
-        graph=source_graph,
-        node_list=src_nodes,
-    )
-    tgt_geom = shortest_path_distance_matrix(
-        graph=target_graph,
-        node_list=tgt_nodes,
-    )
-
-    source_features = torch.from_numpy(src_norm.T.copy())
-    target_features = torch.from_numpy(tgt_norm.T.copy())
-    source_geometry = torch.from_numpy(src_geom)
-    target_geometry = torch.from_numpy(tgt_geom)
-
-    return (
-        source_features,
-        target_features,
-        source_geometry,
-        target_geometry,
-        src_nodes,
-        tgt_nodes,
-        applied_weights,
-        feat_names,
-    )
-
-
-def run_fugw_alignment(
-    source_graph: nx.Graph,
-    target_graph: nx.Graph,
-    source_annotations: Dict[str, List[str]],
-    target_annotations: Dict[str, List[str]],
-    feature_config: FeatureConfig,
-    align_config: AlignmentConfig,
+def _standardize_pair(
+    source_features: torch.Tensor | Any,
+    target_features: torch.Tensor | Any,
     *,
-    feature_weights: Optional[np.ndarray] = None,
-    ground_truth: Optional[Mapping[str, str]] = None,
-    infer_truth: bool = True,
-    eval_top_k: int = 5,
+    eps: float,
+    normalize: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Optionally center/scale both feature matrices together.
+    """
+
+    src = torch.as_tensor(source_features, dtype=torch.float32)
+    tgt = torch.as_tensor(target_features, dtype=torch.float32)
+    if not normalize:
+        return src, tgt
+
+    combined = torch.cat([src, tgt], dim=0)
+    mean = combined.mean(dim=0)
+    std = combined.std(dim=0, unbiased=False)
+    std = torch.where(std < eps, torch.ones_like(std), std)
+    src = (src - mean) / std
+    tgt = (tgt - mean) / std
+    return src, tgt
+
+
+def _as_torch_feature_matrix(features: torch.Tensor | Any) -> torch.Tensor:
+    """
+    Convert feature matrix shaped (n, d) into the (d, n) tensor FUGW expects.
+    """
+
+    tensor = torch.as_tensor(features, dtype=torch.float32)
+    if tensor.numel() == 0:
+        return torch.empty((0, 0), dtype=torch.float32)
+    return tensor.T.contiguous()
+
+
+def _as_torch_geometry(matrix: torch.Tensor | Any) -> torch.Tensor:
+    """
+    Ensure distance matrices are torch tensors with float32 dtype.
+    """
+
+    return torch.as_tensor(matrix, dtype=torch.float32)
+
+
+def fugw_align(
+    source_graph: nx.Graph,
+    target_graph: nx.Graph,
+    *,
+    feature_config: FeatureConfig = FeatureConfig(),
+    align_config: AlignmentConfig = AlignmentConfig(),
+    feature_path: str = "",
+    output_dir: str = "/home/bcl/wanghongyu/other/networkscience/data/NAPAbench/outputs",
 ) -> Dict[str, Any]:
     """
-    核心管线：生成特征/几何 -> 运行 FUGW -> 输出耦合与评估。
+    Run FUGW using structural features + geodesic distances.
 
     Returns
     -------
     Dict[str, Any]
-        包含 pi/mapping/topk/metrics 及中间产物。
+        Keys: `pi`, `source_nodes`, `target_nodes`, `feature_names`,
+        `source_features`, `target_features`, `source_geometry`, `target_geometry`.
     """
 
-    (
-        source_features,
-        target_features,
-        source_geometry,
-        target_geometry,
-        src_nodes,
-        tgt_nodes,
-        used_weights,
-        feature_names,
-    ) = _prepare_features_and_geometry(
-        source_graph=source_graph,
-        target_graph=target_graph,
-        source_annotations=source_annotations,
-        target_annotations=target_annotations,
-        feature_config=feature_config,
-        feature_weights=feature_weights,
+    output_path, current_time = prepare_output_dir(output_dir)
+
+    cached_data = load_cached_features(feature_path) if feature_path else None
+    if cached_data:
+        current_src_nodes: List[str] = sorted(source_graph.nodes())
+        current_tgt_nodes: List[str] = sorted(target_graph.nodes())
+        if (
+            cached_data.source_nodes != current_src_nodes
+            or cached_data.target_nodes != current_tgt_nodes
+        ):
+            LOGGER.warning(
+                "Cached features at %s do not match current graphs, recomputing.",
+                feature_path,
+            )
+            cached_data = None
+
+    if cached_data:
+        LOGGER.info("Loaded cached features from %s", feature_path)
+        src_features = cached_data.source_features
+        tgt_features = cached_data.target_features
+        feature_names = cached_data.feature_names
+        src_nodes = cached_data.source_nodes
+        tgt_nodes = cached_data.target_nodes
+        src_geometry = cached_data.source_geometry
+        tgt_geometry = cached_data.target_geometry
+    else:
+        if feature_path:
+            LOGGER.info("Failed to load cached features from %s, recomputing.", feature_path)
+        src_features_raw, feature_names, src_nodes = get_node_features(source_graph)
+        tgt_features_raw, _, tgt_nodes = get_node_features(target_graph)
+        src_features, tgt_features = _standardize_pair(
+            src_features_raw,
+            tgt_features_raw,
+            eps=feature_config.eps,
+            normalize=feature_config.normalize,
+        )
+        src_geometry, _ = get_dist_matrix(source_graph, node_order=src_nodes)
+        tgt_geometry, _ = get_dist_matrix(target_graph, node_order=tgt_nodes)
+
+    LOGGER.info(
+        "Source features: %s, Target features: %s",
+        tuple(src_features.shape),
+        tuple(tgt_features.shape),
+    )
+    LOGGER.info(
+        "Source geometry: %s, Target geometry: %s",
+        tuple(src_geometry.shape),
+        tuple(tgt_geometry.shape),
     )
 
+    source_features_tensor = _as_torch_feature_matrix(src_features)
+    target_features_tensor = _as_torch_feature_matrix(tgt_features)
+    source_geometry_tensor = _as_torch_geometry(src_geometry)
+    target_geometry_tensor = _as_torch_geometry(tgt_geometry)
+
     ns, nt = len(src_nodes), len(tgt_nodes)
-    source_weights = torch.full((ns,), 1.0 / max(ns, 1), dtype=torch.float32)
-    target_weights = torch.full((nt,), 1.0 / max(nt, 1), dtype=torch.float32)
+
+    metadata = {
+        "feature_names": feature_names,
+        "source_nodes": src_nodes,
+        "target_nodes": tgt_nodes,
+    }
+    params_payload = {
+        "timestamp": current_time,
+        "output_path": str(output_path),
+        "feature_cache_path": feature_path or "",
+        "feature_config": asdict(feature_config),
+        "align_config": asdict(align_config),
+        "source_node_count": ns,
+        "target_node_count": nt,
+    }
+    artifact_paths = save_alignment_inputs(
+        output_path,
+        source_features=src_features,
+        target_features=tgt_features,
+        source_geometry=src_geometry,
+        target_geometry=tgt_geometry,
+        metadata=metadata,
+        params=params_payload,
+    )
+
+    if ns == 0 or nt == 0:
+        LOGGER.warning("No nodes in source or target graph, returning empty coupling matrix")
+        empty_coupling = torch.zeros((ns, nt), dtype=torch.float32)
+        save_alignment_results(
+            output_path,
+            coupling=empty_coupling,
+            status="empty_graph",
+            artifact_paths=artifact_paths,
+            extra={
+                "timestamp": current_time,
+                "feature_cache_path": feature_path or "",
+            },
+        )
+        return {
+            "pi": empty_coupling,
+            "source_nodes": src_nodes,
+            "target_nodes": tgt_nodes,
+            "feature_names": feature_names,
+            "source_features": src_features,
+            "target_features": tgt_features,
+            "source_geometry": src_geometry,
+            "target_geometry": tgt_geometry,
+            "output_path": str(output_path),
+        }
+
+    source_weights = torch.full((ns,), 1.0 / ns, dtype=torch.float32)
+    target_weights = torch.full((nt,), 1.0 / nt, dtype=torch.float32)
 
     model = FUGW(
         alpha=align_config.alpha,
@@ -220,10 +229,10 @@ def run_fugw_alignment(
         eps=align_config.eps,
     )
     model.fit(
-        source_features=source_features,
-        target_features=target_features,
-        source_geometry=source_geometry,
-        target_geometry=target_geometry,
+        source_features=source_features_tensor,
+        target_features=target_features_tensor,
+        source_geometry=source_geometry_tensor,
+        target_geometry=target_geometry_tensor,
         source_weights=source_weights,
         target_weights=target_weights,
         solver=align_config.solver,
@@ -233,71 +242,24 @@ def run_fugw_alignment(
     )
 
     coupling = model.pi.detach().cpu()
-    mapping = argmax_alignment(coupling, src_nodes, tgt_nodes)
-    topk = topk_alignment(coupling, src_nodes, tgt_nodes, k=eval_top_k)
-
-    if ground_truth is None and infer_truth:
-        ground_truth = infer_ground_truth_by_suffix(src_nodes, tgt_nodes)
-
-    metrics = {}
-    if ground_truth:
-        metrics = {
-            "node_correctness": node_correctness(mapping, ground_truth),
-            "recall_at_k": recall_at_k(topk, ground_truth, k=eval_top_k),
-            "precision_at_k": precision_at_k(topk, ground_truth, k=eval_top_k),
-            "edge_correctness": edge_correctness(source_graph, target_graph, mapping),
-            "s3": s3_score(source_graph, target_graph, mapping),
-        }
-
+    save_alignment_results(
+        output_path,
+        coupling=coupling,
+        status="ok",
+        artifact_paths=artifact_paths,
+        extra={
+            "timestamp": current_time,
+            "feature_cache_path": feature_path or "",
+        },
+    )
     return {
         "pi": coupling,
-        "mapping": mapping,
-        "topk": topk,
-        "metrics": metrics,
         "source_nodes": src_nodes,
         "target_nodes": tgt_nodes,
         "feature_names": feature_names,
-        "feature_weights": used_weights,
+        "source_features": src_features,
+        "target_features": tgt_features,
+        "source_geometry": src_geometry,
+        "target_geometry": tgt_geometry,
+        "output_path": str(output_path),
     }
-
-
-def align_family(
-    family_dir: Path,
-    feature_config: FeatureConfig = FeatureConfig(),
-    align_config: AlignmentConfig = AlignmentConfig(),
-    *,
-    feature_weights: Optional[np.ndarray] = None,
-    ground_truth: Optional[Mapping[str, str]] = None,
-    infer_truth: bool = True,
-    eval_top_k: int = 5,
-) -> Dict[str, Any]:
-    """
-    针对单个 family（默认 A/B）运行完整对齐。
-    """
-
-    family_dir = Path(family_dir).resolve()
-    family: FamilyData = load_family_data(family_dir)
-
-    sid = align_config.source_id.upper()
-    tid = align_config.target_id.upper()
-    if sid not in family.graphs or tid not in family.graphs:
-        raise KeyError(f"未找到 {sid}/{tid} 网络，请检查 family 目录。")
-
-    result = run_fugw_alignment(
-        source_graph=family.graphs[sid],
-        target_graph=family.graphs[tid],
-        source_annotations=family.annotations.get(sid, {}),
-        target_annotations=family.annotations.get(tid, {}),
-        feature_config=feature_config,
-        align_config=align_config,
-        feature_weights=feature_weights,
-        ground_truth=ground_truth,
-        infer_truth=infer_truth,
-        eval_top_k=eval_top_k,
-    )
-    return result
-
-
-if __name__ == "__main__":
-    print("Test")
-
