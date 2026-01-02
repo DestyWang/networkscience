@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import torch
@@ -103,6 +103,7 @@ def fugw_align(
     align_config: AlignmentConfig = AlignmentConfig(),
     feature_path: str = "",
     output_dir: str = "/home/bcl/wanghongyu/other/networkscience/data/NAPAbench/outputs",
+    sim_mat: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Run FUGW using structural features + geodesic distances.
@@ -118,8 +119,8 @@ def fugw_align(
 
     cached_data = load_cached_features(feature_path) if feature_path else None
     if cached_data:
-        current_src_nodes: List[str] = sorted(source_graph.nodes())
-        current_tgt_nodes: List[str] = sorted(target_graph.nodes())
+        current_src_nodes: List[str] = list(source_graph.nodes())
+        current_tgt_nodes: List[str] = list(target_graph.nodes())
         if (
             cached_data.source_nodes != current_src_nodes
             or cached_data.target_nodes != current_tgt_nodes
@@ -195,6 +196,14 @@ def fugw_align(
         params=params_payload,
     )
 
+    sim_tensor: Optional[torch.Tensor] = None
+    if sim_mat is not None:
+        sim_tensor = torch.as_tensor(sim_mat, dtype=torch.float32)
+        if sim_tensor.shape != (ns, nt):
+            raise ValueError(
+                "sim_mat shape must match (len(source_nodes), len(target_nodes))."
+            )
+
     if ns == 0 or nt == 0:
         LOGGER.warning("No nodes in source or target graph, returning empty coupling matrix")
         empty_coupling = torch.zeros((ns, nt), dtype=torch.float32)
@@ -220,8 +229,20 @@ def fugw_align(
             "output_path": str(output_path),
         }
 
-    source_weights = torch.full((ns,), 1.0 / ns, dtype=torch.float32)
-    target_weights = torch.full((nt,), 1.0 / nt, dtype=torch.float32)
+    if sim_tensor is not None:
+        row_sums = sim_tensor.sum(dim=1)
+        col_sums = sim_tensor.sum(dim=0)
+        total_mass = row_sums.sum()
+        if total_mass <= 0:
+            LOGGER.warning("sim_mat mass is zero; falling back to uniform marginals.")
+            source_weights = torch.full((ns,), 1.0 / ns, dtype=torch.float32)
+            target_weights = torch.full((nt,), 1.0 / nt, dtype=torch.float32)
+        else:
+            source_weights = row_sums / total_mass
+            target_weights = col_sums / total_mass
+    else:
+        source_weights = torch.full((ns,), 1.0 / ns, dtype=torch.float32)
+        target_weights = torch.full((nt,), 1.0 / nt, dtype=torch.float32)
 
     model = FUGW(
         alpha=align_config.alpha,

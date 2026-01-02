@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import networkx as nx
-
+import torch
 from src.utils import tensor_to_numpy
 
 
@@ -43,8 +43,10 @@ def plot_heatmap(
     """
     Generic helper to visualize matrices such as distance / coupling / similarity.
     """
-
-    array = tensor_to_numpy(matrix)
+    if isinstance(matrix, torch.Tensor):
+        array = matrix.detach().cpu().numpy()
+    else:
+        array = matrix
     fig, ax = plt.subplots(figsize=(8, 6))
     heatmap = ax.imshow(array, aspect="auto", cmap=cmap)
     ax.set_title(title)

@@ -34,7 +34,7 @@ def get_node_features(graph: nx.Graph) -> Tuple[torch.Tensor, List[str], List[st
         Feature matrix shaped (n, 5), human-readable names, and node ordering.
     """
 
-    node_list = sorted(graph.nodes())
+    node_list = list(graph.nodes())
     if not node_list:
         return torch.zeros((0, 0), dtype=torch.float32), [], []
 

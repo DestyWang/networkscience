@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Mapping, Sequence
+from typing import Dict, Mapping, Sequence, List, Tuple
 
 import networkx as nx
 import numpy as np
@@ -50,6 +50,53 @@ def _similarity_matrix_from_file(
     return matrix
 
 
+def uniform_coupling_from_clusters(
+    cluster_path: Path | str,
+    source_nodes: Sequence[str],
+    target_nodes: Sequence[str],
+) -> np.ndarray:
+    """
+    Convert IsoRankN `final_cluster` output into a uniform coupling matrix.
+
+    Each valid cluster (containing at least one source node and one target node)
+    contributes the same total mass, which is distributed uniformly across all
+    cross-network pairs inside that cluster. The resulting matrix sums to 1.0 and
+    can be evaluated with the same metrics used for FUGW couplings.
+    """
+
+    source_index = {node: idx for idx, node in enumerate(source_nodes)}
+    target_index = {node: idx for idx, node in enumerate(target_nodes)}
+    clusters: List[Tuple[List[int], List[int]]] = []
+
+    with Path(cluster_path).open("r", encoding="utf-8") as file_obj:
+        for line in file_obj:
+            tokens = line.strip().split()
+            if not tokens:
+                continue
+            src_idx: List[int] = []
+            tgt_idx: List[int] = []
+            for token in tokens:
+                if token in source_index:
+                    src_idx.append(source_index[token])
+                elif token in target_index:
+                    tgt_idx.append(target_index[token])
+            if src_idx and tgt_idx:
+                clusters.append((src_idx, tgt_idx))
+
+    matrix = np.zeros((len(source_nodes), len(target_nodes)), dtype=np.float64)
+    if not clusters:
+        return matrix
+
+    cluster_mass = 1.0 / len(clusters)
+    for src_idx, tgt_idx in clusters:
+        weight = cluster_mass / (len(src_idx) * len(tgt_idx))
+        for i in src_idx:
+            for j in tgt_idx:
+                matrix[i, j] += weight
+
+    return matrix
+
+
 def sim_score(
     sim_path: Path | str,
     coupling: np.ndarray | torch.Tensor,
@@ -67,7 +114,7 @@ def sim_score(
     return float(np.sum(P * S))
 
 
-def FO_consistency(
+def FO_con_soft(
     coupling: np.ndarray | torch.Tensor,
     source_nodes: Sequence[str],
     target_nodes: Sequence[str],
@@ -94,6 +141,66 @@ def FO_consistency(
     return float(np.sum(P * indicator))
 
 
+def FO_con_hard(
+    coupling: np.ndarray | torch.Tensor,
+    source_nodes: Sequence[str],
+    target_nodes: Sequence[str],
+    source_annotations: Mapping[str, Sequence[str]],
+    target_annotations: Mapping[str, Sequence[str]],
+    *,
+    axis: str = "source",
+) -> float:
+    """
+    Hard-assign FO consistency via row/column argmax.
+
+    axis = 'source'  -> match source->target (row-wise argmax)
+    axis = 'target'  -> match target->source (column-wise argmax)
+    """
+
+    axis = axis.lower()
+    if axis not in {"source", "target"}:
+        raise ValueError("axis must be 'source' or 'target'")
+
+    P = _ensure_matrix(coupling)
+    if P.shape != (len(source_nodes), len(target_nodes)):
+        raise ValueError("耦合矩阵尺寸与节点数量不一致。")
+
+    src_lookup = {node: set(source_annotations.get(node, [])) for node in source_nodes}
+    tgt_lookup = {node: set(target_annotations.get(node, [])) for node in target_nodes}
+
+    if axis == "source":
+        assignments = np.argmax(P, axis=1)
+        hits = 0
+        considered = 0
+        for i, j in enumerate(assignments):
+            labels_src = src_lookup.get(source_nodes[i], set())
+            if not labels_src:
+                continue
+            considered += 1
+            labels_tgt = tgt_lookup.get(target_nodes[int(j)], set())
+            if labels_src & labels_tgt:
+                hits += 1
+        if considered == 0:
+            return float("nan")
+        return hits / considered
+
+    # axis == "target"
+    assignments = np.argmax(P, axis=0)
+    hits = 0
+    considered = 0
+    for j, i in enumerate(assignments):
+        labels_tgt = tgt_lookup.get(target_nodes[j], set())
+        if not labels_tgt:
+            continue
+        considered += 1
+        labels_src = src_lookup.get(source_nodes[int(i)], set())
+        if labels_src & labels_tgt:
+            hits += 1
+    if considered == 0:
+        return float("nan")
+    return hits / considered
+
+
 def _topk_hits(
     matrix: np.ndarray,
     label_lookup_a: Dict[str, set],
@@ -111,15 +218,18 @@ def _topk_hits(
         return float("nan")
 
     hits = 0
+    considered = 0
     for i, node in enumerate(nodes_a):
         labels = label_lookup_a.get(node, set())
         if not labels:
             continue
+        considered += 1
         topk_idx = np.argsort(matrix[i])[::-1][: min(k, matrix.shape[1])]
         if any(labels & label_lookup_b.get(nodes_b[j], set()) for j in topk_idx):
             hits += 1
-    total = len(nodes_a)
-    return hits / total if total else float("nan")
+    if considered == 0:
+        return float("nan")
+    return hits / considered
 
 
 def topk_FO_recall(
@@ -169,8 +279,10 @@ def _argmax_mapping(
     Deterministic mapping derived from the maximum of each row.
     """
 
+    if matrix.shape[0] != len(source_nodes) or matrix.shape[1] != len(target_nodes):
+        raise ValueError("Matrix shape does not align with node lists.")
     indices = np.argmax(matrix, axis=1)
-    return {source_nodes[i]: target_nodes[j] for i, j in enumerate(indices)}
+    return {source_nodes[i]: target_nodes[int(j)] for i, j in enumerate(indices)}
 
 
 def _count_preserved_edges(
@@ -193,19 +305,11 @@ def _count_preserved_edges(
     return count
 
 
-def S3_hard(
+def _s3_from_mapping(
     graph_source: nx.Graph,
     graph_target: nx.Graph,
-    coupling: np.ndarray | torch.Tensor,
-    source_nodes: Sequence[str],
-    target_nodes: Sequence[str],
+    mapping: Mapping[str, str],
 ) -> float:
-    """
-    S³ 指标（hard mapping 版本）。
-    """
-
-    P = _ensure_matrix(coupling)
-    mapping = _argmax_mapping(P, source_nodes, target_nodes)
     conserved = _count_preserved_edges(graph_source, graph_target, mapping)
     denom = (
         graph_source.number_of_edges()
@@ -217,6 +321,43 @@ def S3_hard(
     return conserved / denom
 
 
+def S3_hard(
+    graph_source: nx.Graph,
+    graph_target: nx.Graph,
+    coupling: np.ndarray | torch.Tensor,
+    source_nodes: Sequence[str],
+    target_nodes: Sequence[str],
+) -> float:
+    """
+    S³ 指标（hard mapping 版本，双向平均）。
+    """
+
+    P = _ensure_matrix(coupling)
+    mapping_src = _argmax_mapping(P, source_nodes, target_nodes)
+    mapping_tgt = _argmax_mapping(P.T, target_nodes, source_nodes)
+
+    score_src = _s3_from_mapping(graph_source, graph_target, mapping_src)
+    score_tgt = _s3_from_mapping(graph_target, graph_source, mapping_tgt)
+
+    if np.isnan(score_src) and np.isnan(score_tgt):
+        return float("nan")
+    if np.isnan(score_src):
+        return score_tgt
+    if np.isnan(score_tgt):
+        return score_src
+    return 0.5 * (score_src + score_tgt)
+
+
+def _adjacency_matrix(graph: nx.Graph, nodes: Sequence[str]) -> np.ndarray:
+    """
+    Return a float64 adjacency matrix with zeroed diagonal for the provided node order.
+    """
+
+    adj = nx.to_numpy_array(graph, nodelist=nodes, dtype=np.float64)
+    np.fill_diagonal(adj, 0.0)
+    return adj
+
+
 def S3_soft(
     graph_source: nx.Graph,
     graph_target: nx.Graph,
@@ -225,26 +366,27 @@ def S3_soft(
     target_nodes: Sequence[str],
 ) -> float:
     """
-    S³ 指标（soft / coupling 版本）。
+    S³ 指标（soft / coupling 版本，双向平均）。
     """
 
     P = _ensure_matrix(coupling)
     if P.shape != (len(source_nodes), len(target_nodes)):
         raise ValueError("耦合矩阵尺寸与节点数量不一致。")
 
-    As = nx.to_numpy_array(graph_source, nodelist=source_nodes, dtype=np.float64)
-    At = nx.to_numpy_array(graph_target, nodelist=target_nodes, dtype=np.float64)
+    As = _adjacency_matrix(graph_source, source_nodes)
+    At = _adjacency_matrix(graph_target, target_nodes)
 
-    overlap_matrix = P @ At @ P.T
-    conserved = 0.5 * float(np.sum(As * overlap_matrix))
-    denom = (
-        graph_source.number_of_edges()
-        + graph_target.number_of_edges()
-        - conserved
-    )
+    proj_source = P @ At @ P.T
+    proj_target = P.T @ As @ P
+
+    conserved_src = 0.5 * float(np.sum(As * proj_source))
+    conserved_tgt = 0.5 * float(np.sum(At * proj_target))
+    conserved = 0.5 * (conserved_src + conserved_tgt)
+
+    edges_source = graph_source.number_of_edges()
+    edges_target = graph_target.number_of_edges()
+    denom = edges_source + edges_target - conserved
     if denom == 0:
         return float("nan")
     return conserved / denom
-
-
 

@@ -276,7 +276,7 @@ def visualize_family(
     return figures
 
 
-def get_dist_matrix(raph: nx.Graph,node_order: Sequence[str] | None = None) -> Tuple[torch.Tensor, List[str]]:
+def get_dist_matrix(graph: nx.Graph,node_order: Sequence[str] | None = None) -> Tuple[torch.Tensor, List[str]]:
     """
     Compute the all-pairs shortest path distances for the requested graph.
 
@@ -285,7 +285,7 @@ def get_dist_matrix(raph: nx.Graph,node_order: Sequence[str] | None = None) -> T
     graph : nx.Graph
         Input network (treated as undirected and unweighted).
     node_order : Sequence[str] | None
-        Optional deterministic node ordering. Defaults to sorted node ids.
+        Optional deterministic node ordering. Defaults to node order.
 
     Returns
     -------
@@ -294,11 +294,7 @@ def get_dist_matrix(raph: nx.Graph,node_order: Sequence[str] | None = None) -> T
     """
 
     if node_order is None:
-        node_order = sorted(graph.nodes())
-    node_order = list(node_order)
-    if not node_order:
-        return torch.zeros((0, 0), dtype=torch.float32), []
-
+        node_order = list(graph.nodes())
     adjacency = nx.to_numpy_array(
         graph,
         nodelist=node_order,
