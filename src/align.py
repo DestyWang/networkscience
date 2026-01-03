@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, field
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -40,12 +41,12 @@ class AlignmentConfig:
     Configuration for the FUGW solver.
     """
 
-    alpha: float = 0.5
-    rho: float = 10
-    eps: float = 1e-4
+    alpha: float = 0.9
+    rho: float = 0.1
+    eps: float = 1e-5
     solver: str = "sinkhorn"
     solver_params: Dict[str, Any] = field(
-        default_factory=lambda: {"nits_bcd": 20, "nits_uot": 1000, "tol_bcd": 1e-4,"tol_uot": 1e-10}
+        default_factory=lambda: {"nits_bcd": 25, "nits_uot": 1000, "tol_bcd": 1e-4,"tol_uot": 1e-10}
     )
     device: str = "cuda"
     verbose: bool = True
@@ -249,6 +250,7 @@ def fugw_align(
         rho=align_config.rho,
         eps=align_config.eps,
     )
+    start_time = perf_counter()
     model.fit(
         source_features=source_features_tensor,
         target_features=target_features_tensor,
@@ -261,6 +263,12 @@ def fugw_align(
         device=align_config.device,
         verbose=align_config.verbose,
     )
+    runtime_seconds = perf_counter() - start_time
+    loss_value = float(getattr(model, "loss", float("nan")))
+    loss_history_raw = getattr(model, "loss_steps", None)
+    loss_history = (
+        [float(item) for item in loss_history_raw] if loss_history_raw is not None else []
+    )
 
     coupling = model.pi.detach().cpu()
     save_alignment_results(
@@ -271,6 +279,9 @@ def fugw_align(
         extra={
             "timestamp": current_time,
             "feature_cache_path": feature_path or "",
+            "runtime_seconds": runtime_seconds,
+            "loss_value": loss_value,
+            "loss_history": loss_history,
         },
     )
     return {
@@ -283,4 +294,7 @@ def fugw_align(
         "source_geometry": src_geometry,
         "target_geometry": tgt_geometry,
         "output_path": str(output_path),
+        "loss": loss_value,
+        "loss_history": loss_history,
+        "runtime_seconds": runtime_seconds,
     }

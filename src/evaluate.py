@@ -56,12 +56,14 @@ def uniform_coupling_from_clusters(
     target_nodes: Sequence[str],
 ) -> np.ndarray:
     """
-    Convert IsoRankN `final_cluster` output into a uniform coupling matrix.
+    Convert IsoRankN `final_cluster` output into a coupling matrix that preserves
+    1-to-n / n-to-1 confidence.
 
-    Each valid cluster (containing at least one source node and one target node)
-    contributes the same total mass, which is distributed uniformly across all
-    cross-network pairs inside that cluster. The resulting matrix sums to 1.0 and
-    can be evaluated with the same metrics used for FUGW couplings.
+    对每个 cluster：
+    - 若只包含 1 个源节点对应多个目标节点，则每个 pair 权重为 1 / len(target)。
+    - 若只包含 1 个目标节点对应多个源节点，则每个 pair 权重为 1 / len(source)。
+    - 其余情况退化为源/目标节点两两均匀配对。
+    最后对整张矩阵进行一次全局归一化，使其总和为 1。
     """
 
     source_index = {node: idx for idx, node in enumerate(source_nodes)}
@@ -87,12 +89,28 @@ def uniform_coupling_from_clusters(
     if not clusters:
         return matrix
 
-    cluster_mass = 1.0 / len(clusters)
     for src_idx, tgt_idx in clusters:
-        weight = cluster_mass / (len(src_idx) * len(tgt_idx))
-        for i in src_idx:
-            for j in tgt_idx:
-                matrix[i, j] += weight
+        if len(src_idx) == 1 and len(tgt_idx) >= 1:
+            weight = 1.0 / len(tgt_idx)
+            src = src_idx[0]
+            for tgt in tgt_idx:
+                matrix[src, tgt] += weight
+        elif len(tgt_idx) == 1 and len(src_idx) >= 1:
+            weight = 1.0 / len(src_idx)
+            tgt = tgt_idx[0]
+            for src in src_idx:
+                matrix[src, tgt] += weight
+        else:
+            if not src_idx or not tgt_idx:
+                continue
+            weight = 1.0 / (len(src_idx) * len(tgt_idx))
+            for src in src_idx:
+                for tgt in tgt_idx:
+                    matrix[src, tgt] += weight
+
+    total_mass = matrix.sum()
+    if total_mass > 0:
+        matrix /= total_mass
 
     return matrix
 

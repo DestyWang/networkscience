@@ -1,0 +1,9 @@
+nohup: ignoring input
+2026-01-03 11:13:31,126 | INFO | __main__ | Processing 2way/CG/family1
+2026-01-03 11:13:31,142 | INFO | src.process | Loaded A (3000 nodes, 11987 edges)
+2026-01-03 11:13:31,162 | INFO | src.process | Loaded B (4000 nodes, 15987 edges)
+2026-01-03 11:13:31,163 | INFO | src.process | Loaded A annotations (2195 nodes with FO labels)
+2026-01-03 11:13:31,165 | INFO | src.process | Loaded B annotations (2190 nodes with FO labels)
+2026-01-03 11:13:31,428 | INFO | src.process | Loaded similarity file A-B (62342 pairs)
+2026-01-03 11:13:31,428 | INFO | __main__ | Found 2 networks -> 1 unique pairs for family1
+2026-01-03 11:13:31,428 | INFO | __main__ | Aligning A vs B
