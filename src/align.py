@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, field
+from numbers import Number
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -94,6 +95,64 @@ def _as_torch_geometry(matrix: torch.Tensor | Any) -> torch.Tensor:
     """
 
     return torch.as_tensor(matrix, dtype=torch.float32)
+
+
+def _coerce_scalar(value: Any) -> float:
+    """
+    Safely cast scalar-like objects into float (shape=()).
+
+    Parameters
+    ----------
+    value : Any
+        Single numeric value or tensor（shape=()）。
+
+    Returns
+    -------
+    float
+        标量结果，shape=()；若无法转换，则返回 NaN。
+    """
+
+    if isinstance(value, Number):
+        return float(value)
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return float("nan")
+    return float("nan")
+
+
+def _normalize_loss_terms(loss_payload: Any) -> Optional[Dict[str, Any]]:
+    """
+    Convert `model.loss` payload into JSON-safe dict of floats.
+
+    Parameters
+    ----------
+    loss_payload : Any
+        原始 `model.loss` 对象，通常为 Dict[str, Sequence[number]]。
+
+    Returns
+    -------
+    Optional[Dict[str, Any]]
+        若可解析，则返回 {str: List[float] 或 float shape=()} 的字典；
+        否则返回 None。
+    """
+
+    if not isinstance(loss_payload, dict):
+        return None
+
+    normalized: Dict[str, Any] = {}
+    for key, series in loss_payload.items():
+        if isinstance(series, dict):
+            normalized[key] = _normalize_loss_terms(series)
+            continue
+        if isinstance(series, (list, tuple)):
+            normalized[key] = [_coerce_scalar(item) for item in series]
+            continue
+        if torch.is_tensor(series):
+            normalized[key] = _coerce_scalar(series)
+            continue
+        normalized[key] = _coerce_scalar(series)
+    return normalized
 
 
 def fugw_align(
@@ -264,25 +323,35 @@ def fugw_align(
         verbose=align_config.verbose,
     )
     runtime_seconds = perf_counter() - start_time
-    loss_value = float(getattr(model, "loss", float("nan")))
+    loss_terms = _normalize_loss_terms(getattr(model, "loss", None))
+    if loss_terms and isinstance(loss_terms.get("total"), list) and loss_terms["total"]:
+        loss_value = float(loss_terms["total"][-1])
+    elif loss_terms and isinstance(loss_terms.get("total"), (int, float)):
+        loss_value = float(loss_terms["total"])
+    else:
+        loss_value = _coerce_scalar(getattr(model, "loss", float("nan")))
     loss_history_raw = getattr(model, "loss_steps", None)
     loss_history = (
         [float(item) for item in loss_history_raw] if loss_history_raw is not None else []
     )
 
     coupling = model.pi.detach().cpu()
+    extra_payload: Dict[str, Any] = {
+        "timestamp": current_time,
+        "feature_cache_path": feature_path or "",
+        "runtime_seconds": runtime_seconds,
+        "loss_value": loss_value,
+        "loss_history": loss_history,
+    }
+    if loss_terms is not None:
+        extra_payload["loss_terms"] = loss_terms
+
     save_alignment_results(
         output_path,
         coupling=coupling,
         status="ok",
         artifact_paths=artifact_paths,
-        extra={
-            "timestamp": current_time,
-            "feature_cache_path": feature_path or "",
-            "runtime_seconds": runtime_seconds,
-            "loss_value": loss_value,
-            "loss_history": loss_history,
-        },
+        extra=extra_payload,
     )
     return {
         "pi": coupling,
@@ -295,6 +364,7 @@ def fugw_align(
         "target_geometry": tgt_geometry,
         "output_path": str(output_path),
         "loss": loss_value,
+        "loss_terms": loss_terms,
         "loss_history": loss_history,
         "runtime_seconds": runtime_seconds,
     }

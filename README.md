@@ -50,6 +50,10 @@ pi = result["pi"].numpy()
   family 执行两两配准，并将每个 pair 的输出结构化写入
   `outputs/<suite>/<category>/<family>/<pair>/<timestamp>/...`，同时在 family
   级别生成整合的 `results.json` 方便后续检索。
+- `src/utils.py` – shared helpers (tensor-to-numpy conversions)；`src/align.py`
+  默认在 `results.json` 写入完整的 FUGW `loss_terms` 字典，含
+  `wasserstein`/`gromov_wasserstein`/`marginal_constraint_dim1`/
+  `marginal_constraint_dim2`/`regularization`/`total` 六个序列，便于追踪收敛。
 - `src/vis.py` – matplotlib helpers (degree histogram, matrix heatmap).
 - `src/utils.py` – shared helpers (tensor-to-numpy conversions).
 
@@ -66,7 +70,7 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u -m src.align_all \
 ```
 ```bash
 CUDA_VISIBLE_DEVICES=2 nohup python -u -m src.align_all > all_families.log 2>&1 &
- 2864276
+ 3873633
 ```
 
 - 默认数据目录：`data/NAPAbench/NAPAbenchVer2/benchmarkDataset`；
@@ -74,6 +78,7 @@ CUDA_VISIBLE_DEVICES=2 nohup python -u -m src.align_all > all_families.log 2>&1 
 - 5way/8way family 下会为每个组合网络建立 `A_vs_B` 子目录；`fugw_align` 会在其内
   生成时间戳子文件夹并保存 coupling/特征/元数据。2way 也沿用相同结构。
 - 脚本会在 family 根目录生成 `results.json`，列出所有成功 pair 的
-  `loss`（shape=()）、`runtime_seconds`（shape=()）、节点规模和输出路径，方便横向比对。
+  `loss`（shape=()，即 `loss_terms['total']` 的最终元素）、`loss_terms` 字典、
+  `runtime_seconds`（shape=()）、节点规模和输出路径，方便横向比对。
 - 可使用 `--suite/--category/--family` 多次传入过滤目标，也可通过 `--limit`
   控制处理的 family 数量；`--device` 直接透传给 `AlignmentConfig.device`。

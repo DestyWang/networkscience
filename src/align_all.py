@@ -113,6 +113,38 @@ def _pair_label(source: str, target: str) -> str:
     return f"{source}_vs_{target}"
 
 
+def _extract_total_loss(loss_terms: Any, fallback: Any = float("nan")) -> float:
+    """
+    从 loss_terms 中抽取最终 total 损失值（shape=()）。
+
+    Parameters
+    ----------
+    loss_terms : Any
+        `model.loss` 归一化字典，或其他任意类型。
+    fallback : Any
+        兜底标量（shape=()），无法解析字典时使用。
+
+    Returns
+    -------
+    float
+        total 列表的末项（shape=()），若缺失则返回 fallback 或 NaN。
+    """
+
+    if isinstance(loss_terms, dict):
+        total_series = loss_terms.get("total")
+        if isinstance(total_series, (list, tuple)) and total_series:
+            try:
+                return float(total_series[-1])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(total_series, (int, float)):
+            return float(total_series)
+    try:
+        return float(fallback)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _write_family_results(
     family_dir: Path,
     job: FamilyJob,
@@ -144,6 +176,7 @@ def _build_pair_record(
     target: str,
     output_path: str,
     loss_value: float,
+    loss_terms: Any,
     runtime_seconds: float,
     source_nodes: Sequence[str],
     target_nodes: Sequence[str],
@@ -170,6 +203,7 @@ def _build_pair_record(
         "timestamp": output_dir.name,
         "output_path": str(output_dir),
         "loss": loss_value,
+        "loss_terms": loss_terms,
         "runtime_seconds": runtime_seconds,
         "source_nodes": len(source_nodes),
         "target_nodes": len(target_nodes),
@@ -218,6 +252,7 @@ def _align_family(
                 feature_config=feature_config,
                 align_config=align_config,
                 output_dir=str(pair_dir),
+                sim_mat=None,
             )
         except Exception as exc:  # pragma: no cover - resilience
             LOGGER.exception(
@@ -231,13 +266,17 @@ def _align_family(
             )
             continue
 
+        loss_terms = align_result.get("loss_terms")
+        loss_scalar = _extract_total_loss(loss_terms, align_result.get("loss"))
+
         pair_records.append(
             _build_pair_record(
                 job=job,
                 source=source,
                 target=target,
                 output_path=align_result["output_path"],
-                loss_value=float(align_result.get("loss", float("nan"))),
+                loss_value=loss_scalar,
+                loss_terms=loss_terms,
                 runtime_seconds=float(align_result.get("runtime_seconds", float("nan"))),
                 source_nodes=align_result.get("source_nodes", []),
                 target_nodes=align_result.get("target_nodes", []),
