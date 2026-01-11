@@ -50,6 +50,10 @@ pi = result["pi"].numpy()
   family 执行两两配准，并将每个 pair 的输出结构化写入
   `outputs/<suite>/<category>/<family>/<pair>/<timestamp>/...`，同时在 family
   级别生成整合的 `results.json` 方便后续检索。
+- `IsoRankN/eval_all.py` – 对 `IsoRankN/napa_outputs` 目录下 alpha=0.6/1.0、
+  score/cluster 四种耦合矩阵分别批量计算 10 项对齐指标，并读取运行日志中的
+  runtime（若日志缺失则置为 NaN），结果写入
+  `IsoRankN/eval_all_{1..4}.csv`。
 - `src/utils.py` – shared helpers (tensor-to-numpy conversions)；`src/align.py`
   默认在 `results.json` 写入完整的 FUGW `loss_terms` 字典，含
   `wasserstein`/`gromov_wasserstein`/`marginal_constraint_dim1`/
@@ -82,3 +86,21 @@ CUDA_VISIBLE_DEVICES=2 nohup python -u -m src.align_all > all_families.log 2>&1 
   `runtime_seconds`（shape=()）、节点规模和输出路径，方便横向比对。
 - 可使用 `--suite/--category/--family` 多次传入过滤目标，也可通过 `--limit`
   控制处理的 family 数量；`--device` 直接透传给 `AlignmentConfig.device`。
+
+## IsoRankN 批量评估（`IsoRankN/eval_all.py`）
+
+```bash
+python IsoRankN/eval_all.py
+# 或者:
+python -m IsoRankN.eval_all
+```
+
+- 默认扫描 `IsoRankN/napa_outputs`，对每个 family/pair/alpha 的
+  score/cluster 结果生成 12 项指标（10 个对齐指标 + runtime + total loss）。
+- runtime 通过 `IsoRankN/isorankn_all.log` 中的 `Finished in ... s` 自动解析；
+  IsoRankN 本身未输出 loss，因此 `total_loss` 会置为 `NaN`。
+- 四份汇总表分别写入：
+  - `IsoRankN/eval_all_1.csv`：alpha=0.6 的 score coupling
+  - `IsoRankN/eval_all_2.csv`：alpha=0.6 的 cluster coupling
+  - `IsoRankN/eval_all_3.csv`：alpha=1.0 的 score coupling
+  - `IsoRankN/eval_all_4.csv`：alpha=1.0 的 cluster coupling

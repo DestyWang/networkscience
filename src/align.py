@@ -154,6 +154,62 @@ def _normalize_loss_terms(loss_payload: Any) -> Optional[Dict[str, Any]]:
         normalized[key] = _coerce_scalar(series)
     return normalized
 
+def sim_to_cost(
+    S: torch.Tensor,
+    q_low: float = 0.01,
+    q_high: float = 0.99,
+    eps: float = 1e-8,
+    scale_median_to_1: bool = True,
+) -> torch.Tensor:
+    """
+    将非负相似度矩阵 S 转换为 OT 可用的 cost matrix C（同形状）。
+
+    参数
+    ----------
+    S : torch.Tensor, shape (n, m)
+        非负相似度分数矩阵（允许 0；数值可很大，如几百/几千）。
+    q_low : float
+        低分位数裁剪（默认 1%），用于鲁棒归一化。
+    q_high : float
+        高分位数裁剪（默认 99%），用于鲁棒归一化。
+    eps : float
+        数值稳定项，避免 log(0)。建议 1e-12 ~ 1e-6。
+    scale_median_to_1 : bool
+        是否将输出 C 再缩放，使 median(C)=1，便于后续 Sinkhorn 等算法调参。
+
+    返回
+    ----
+    C : torch.Tensor, shape (n, m)
+        非负 cost matrix；越相似 cost 越小。
+    """
+    if not isinstance(S, torch.Tensor):
+        S = torch.as_tensor(S)
+    if S.ndim != 2:
+        raise ValueError(f"S 必须是二维矩阵，当前 S.ndim={S.ndim}")
+    if torch.any(S < 0):
+        raise ValueError("S 必须非负（>=0）")
+    
+    S = S.to(dtype=torch.float64)
+    # 1) 压缩动态范围：log(1+S)
+    T = torch.log1p(S)
+    
+    # 2) 分位数裁剪 + 归一化到 [0,1]
+    a = torch.quantile(T, q_low)
+    b = torch.quantile(T, q_high)
+    denom = max((b - a).item(), eps)
+    U = (T - a) / denom
+    U = U.clamp(0.0, 1.0)
+    
+    # 3) 转为代价：-log(U + eps)
+    C = -torch.log(U + eps)
+    
+    # 可选：把尺度归一到 median(C)=1，方便后续算法（尤其 Sinkhorn）稳定
+    if scale_median_to_1:
+        med = torch.median(C)
+        if med > 0:
+            C = C / med
+    
+    return C
 
 def fugw_align(
     source_graph: nx.Graph,
@@ -263,6 +319,7 @@ def fugw_align(
             raise ValueError(
                 "sim_mat shape must match (len(source_nodes), len(target_nodes))."
             )
+        cost_matrix = sim_to_cost(sim_tensor)
 
     if ns == 0 or nt == 0:
         LOGGER.warning("No nodes in source or target graph, returning empty coupling matrix")
@@ -313,6 +370,7 @@ def fugw_align(
     model.fit(
         source_features=source_features_tensor,
         target_features=target_features_tensor,
+        cost_matrix=cost_matrix,
         source_geometry=source_geometry_tensor,
         target_geometry=target_geometry_tensor,
         source_weights=source_weights,
