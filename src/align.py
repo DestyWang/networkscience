@@ -217,6 +217,7 @@ def fugw_align(
     *,
     feature_config: FeatureConfig = FeatureConfig(),
     align_config: AlignmentConfig = AlignmentConfig(),
+    use_unit_weights: bool = True,
     feature_path: str = "",
     output_dir: str = "/home/bcl/wanghongyu/other/networkscience/data/NAPAbench/outputs",
     sim_mat: Optional[Any] = None,
@@ -346,7 +347,11 @@ def fugw_align(
             "output_path": str(output_path),
         }
 
-    if sim_tensor is not None:
+    if use_unit_weights:
+        print("Using unit weights")
+        source_weights = torch.full((ns,), 1.0 / ns, dtype=torch.float32)
+        target_weights = torch.full((nt,), 1.0 / nt, dtype=torch.float32)
+    elif sim_tensor is not None:
         row_sums = sim_tensor.sum(dim=1)
         col_sums = sim_tensor.sum(dim=0)
         total_mass = row_sums.sum()

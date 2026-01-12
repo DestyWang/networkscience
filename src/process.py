@@ -4,7 +4,7 @@ import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, MutableMapping, Sequence, Tuple
+from typing import Dict, List, MutableMapping, Sequence, Tuple, Any, Optional, Union
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -15,6 +15,11 @@ import torch
 import math
 from scipy.special import zeta as hurwitz_zeta
 from scipy.optimize import minimize_scalar
+
+import matplotlib as mpl
+from matplotlib.gridspec import GridSpec
+import seaborn as sns
+ArrayLike2D = Union[np.ndarray, "torch.Tensor"]
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -232,7 +237,100 @@ def plot_annotation_histogram(
     fig.tight_layout()
     return fig
 
+def plot_scatter(
+    data: "np.ndarray | torch.Tensor",
+    title: str = "Scatter Plot",
+    color: str = "#377eb8",
+    alpha: float = 0.7,
+    figsize: Tuple[int, int] = (8, 6),
+    point_size: int = 10,
+    reverse_xy: bool = False,
+    direct = False,
+) -> plt.Figure:
+    """
+    绘制散点图，输入为形状 (n, 2) 的 numpy 数组或 torch 张量。
 
+    Parameters
+    ----------
+    data : np.ndarray 或 torch.Tensor
+        形状为 (n, 2)，每行是一个点的坐标。
+    title : str
+        图表标题。
+    color : str
+        点的颜色。
+    alpha : float
+        点的透明度。
+    figsize : tuple
+        画布大小。
+    direct : bool
+        是否直接绘制，如果为 True，则不进行坐标转换。
+    Returns
+    -------
+    plt.Figure
+        matplotlib 图像对象
+    """
+    if 'torch' in str(type(data)):
+        data = data.detach().cpu().numpy()
+    else:
+        data = np.asarray(data)
+    if not direct:
+        indexs = np.where(data>0)
+        if not reverse_xy:
+            points = np.array([indexs[0], indexs[1]]).T
+        else:
+            points = np.array([indexs[1], indexs[0]]).T
+    
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("输入数组形状必须为 (n, 2)")
+
+    fig, ax = plt.subplots(figsize=figsize)
+    print(len(points))
+    ax.scatter(points[:, 0], points[:, 1], c=color, alpha=alpha, s=point_size)
+    ax.set_title(title)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.grid(alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    return fig
+
+def plot_similarity_heatmap(similarity_df: pd.DataFrame, pair_label: str, top_k_pairs: int = 200,) -> plt.Figure:
+    """
+    Plot a heatmap for the highest-scoring subset of similarity pairs.
+
+    Parameters
+    ----------
+    similarity_df : pd.DataFrame
+        DataFrame shaped (m, 3) with the columns
+        ['source_node', 'target_node', 'score'].
+    pair_label : str
+        Identifier for the pair, e.g. 'A-B'.
+    top_k_pairs : int
+        Number of rows to keep before pivoting into a matrix.
+
+    Returns
+    -------
+    plt.Figure
+        Figure object containing the similarity heatmap.
+    """
+
+    subset = similarity_df.nlargest(top_k_pairs, "score")
+    pivot = subset.pivot(
+        index="source_node", columns="target_node", values="score"
+    ).fillna(0.0)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    heatmap = ax.imshow(pivot.values, aspect="auto", cmap="viridis")
+    ax.set_title(f"{pair_label}: top {top_k_pairs} similarity scores")
+    ax.set_xlabel("Target node")
+    ax.set_ylabel("Source node")
+    fig.colorbar(heatmap, ax=ax, fraction=0.025, pad=0.02, label="Score")
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=90, fontsize=6)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=6)
+    fig.tight_layout()
+    return fig
+    
 def visualize_family(
     family_data: FamilyData,
     similarity_pair: Tuple[str, str] = ("A", "B"),
@@ -275,6 +373,175 @@ def visualize_family(
         )
     return figures
 
+def plot_marginal(
+    mat: ArrayLike2D,
+    *,
+    nonneg: str = "clip",
+    eps: float = 1e-12,
+    cmap: str = "mako_r",  # 使用反转的 colormap，默认从黑到白
+    marginal_color: str = "#1f77b4",
+    xlabel: str = "x bin",
+    ylabel: str = "y bin",
+    title: Optional[str] = None,
+    figsize: Tuple[float, float] = (6.6, 5.6),
+    dpi: int = 300,
+    font_family: str = "DejaVu Serif",
+    tick_fontsize: int = 10,
+    label_fontsize: int = 11,
+    title_fontsize: int = 12,
+    show_colorbar: bool = True,
+    savepath: Optional[str] = None,
+) -> Tuple["matplotlib.figure.Figure", Dict[str, Any]]:
+    """
+    绘制二维离散分布的“联合热图 + 边际分布”边际图（publication-quality）。
+
+    参数
+    - mat: (H, W) 二维数组（numpy 或 torch），表示权重/能量/相似度等，将被归一化为分布 P
+    - nonneg: 处理负值策略
+        - "raise": 若存在负值直接报错
+        - "clip": 将负值裁剪为 0 后再归一化（默认）
+        - "shift": 整体平移使最小值为 0 后再归一化
+    - eps: (,) 防止除零的极小值阈值
+    - savepath: 若提供则保存图片（例如 "figs/marginal.png"）
+
+    返回
+    - fig: matplotlib Figure
+    - axes: dict，包含 "joint"（热图）、"top"（x 边际）、"right"（y 边际）、可选 "cax"
+    """
+    # ---- convert to numpy float ----
+    if "torch" in str(type(mat)):
+        # local import to avoid hard dependency in typing
+        if not isinstance(mat, torch.Tensor):
+            raise TypeError(f"Unsupported type: {type(mat)}")
+        a = mat.detach().float().cpu().numpy()
+    else:
+        a = np.asarray(mat, dtype=np.float64)
+
+    if a.ndim != 2:
+        raise ValueError(f"`mat` must be 2D with shape (H, W), got shape={a.shape}")
+
+    if not np.isfinite(a).all():
+        raise ValueError("`mat` contains NaN/Inf, please clean it before plotting.")
+
+    # ---- enforce nonnegative & normalize to probability ----
+    if nonneg not in {"raise", "clip", "shift"}:
+        raise ValueError("`nonneg` must be one of {'raise','clip','shift'}")
+
+    if nonneg == "raise":
+        if (a < 0).any():
+            raise ValueError("`mat` has negative entries; set nonneg='clip' or 'shift'.")
+        w = a
+    elif nonneg == "clip":
+        w = np.clip(a, 0.0, None)
+    else:  # shift
+        w = a - a.min()
+
+    s = float(w.sum())
+    if s <= eps:
+        raise ValueError("Sum of nonnegative weights is ~0; cannot normalize to a distribution.")
+    P = w / s  # (H, W)
+
+    # ---- marginals ----
+    px = P.sum(axis=0)  # (W,)
+    py = P.sum(axis=1)  # (H,)
+
+    mpl.rcParams.update(
+        {
+            "figure.dpi": dpi,
+            "savefig.dpi": dpi,
+            "font.family": font_family,
+            "axes.titlesize": title_fontsize,
+            "axes.labelsize": label_fontsize,
+            "xtick.labelsize": tick_fontsize,
+            "ytick.labelsize": tick_fontsize,
+            "axes.linewidth": 0.8,
+        }
+    )
+
+    try:
+        sns.set_theme(style="white", context="paper")
+        use_seaborn = True
+    except Exception:
+        use_seaborn = False
+
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        width_ratios=(4.2, 1.2),
+        height_ratios=(1.2, 4.2),
+        wspace=0.06,
+        hspace=0.06,
+    )
+
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax_joint = fig.add_subplot(gs[1, 0])
+    ax_right = fig.add_subplot(gs[1, 1])
+    ax_corner = fig.add_subplot(gs[0, 1])  # for colorbar (or empty)
+
+    # top marginal (x)
+    x = np.arange(P.shape[1])
+    ax_top.plot(x, px, color=marginal_color, lw=2.0)
+    ax_top.fill_between(x, 0.0, px, color=marginal_color, alpha=0.22, linewidth=0)
+    ax_top.set_xlim(-0.5, P.shape[1] - 0.5)
+    ax_top.set_ylabel("p(x)")
+    ax_top.tick_params(axis="x", labelbottom=False)
+    ax_top.grid(True, axis="y", alpha=0.25, linewidth=0.6)
+    ax_top.spines["right"].set_visible(False)
+    ax_top.spines["top"].set_visible(False)
+
+    # right marginal (y)
+    y = np.arange(P.shape[0])
+    ax_right.plot(py, y, color=marginal_color, lw=2.0)
+    ax_right.fill_betweenx(y, 0.0, py, color=marginal_color, alpha=0.22, linewidth=0)
+    ax_right.set_ylim(P.shape[0] - 0.5, -0.5)
+    ax_right.set_xlabel("p(y)")
+    ax_right.tick_params(axis="y", labelleft=False)
+    ax_right.grid(True, axis="x", alpha=0.25, linewidth=0.6)
+    ax_right.spines["right"].set_visible(False)
+    ax_right.spines["top"].set_visible(False)
+
+    # joint heatmap
+    # 反转颜色：默认 colormap 设为 _r 结尾或者由用户传入
+    if use_seaborn:
+        hm = sns.heatmap(
+            P,
+            ax=ax_joint,
+            cmap=cmap,
+            cbar=False,  # we draw cbar ourselves
+            square=False,
+            linewidths=0.0,
+            rasterized=True,  # good for vector export
+        )
+        im = hm.collections[0]
+    else:
+        im = ax_joint.imshow(P, cmap=cmap, origin="upper", aspect="auto")
+    ax_joint.set_xlabel(xlabel)
+    ax_joint.set_ylabel(ylabel)
+
+    # colorbar in corner
+    axes: Dict[str, Any] = {"joint": ax_joint, "top": ax_top, "right": ax_right}
+    if show_colorbar:
+        ax_corner.set_axis_off()
+        cax = fig.add_axes(ax_corner.get_position(fig).shrunk(0.55, 0.75).translated(0.25, 0.10))
+        cb = fig.colorbar(im, cax=cax, orientation="vertical")
+        cb.set_label("P(x, y)")
+        cb.outline.set_linewidth(0.6)
+        axes["cax"] = cax
+    else:
+        ax_corner.set_axis_off()
+
+    if title is not None:
+        fig.suptitle(title, y=0.98)
+
+    # tighten without over-squeezing
+    fig.subplots_adjust(left=0.10, right=0.96, bottom=0.10, top=0.92)
+
+    if savepath is not None:
+        fig.savefig(savepath, bbox_inches="tight", dpi=dpi)
+
+    return fig, axes
 
 def get_dist_matrix(graph: nx.Graph,node_order: Sequence[str] | None = None) -> Tuple[torch.Tensor, List[str]]:
     """
@@ -396,7 +663,7 @@ def get_small_worldness(graph: nx.Graph, *, seed: int = 42, n_iter: int = 8,) ->
     rng = np.random.default_rng(seed)
     sigma_samples: List[float] = []
     for _ in range(n_iter):
-        LOGGER.info("Iteration: %s", _)
+        # LOGGER.info("Iteration: %s", _)
         random_graph = nx.gnm_random_graph(
             n,
             m,
