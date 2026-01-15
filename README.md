@@ -64,6 +64,50 @@ pi = result["pi"].numpy()
 Feel free to adapt the configs or plug new metrics as needed; each module is
 kept intentionally concise to encourage experimentation inside notebooks.
 
+## 结构指标：Rich-clubness 与 LCP-corr（`utils.py`）
+
+根目录下的 `utils.py` 提供两个常用的网络结构指标（与 `src/` 解耦，便于在 notebook 中直接调用）。
+
+### Rich-clubness（Cannistraci & Muscoloni 口径，含 p-value）
+
+- **函数**：`get_rich_clubness(G, n_random=200, nswap_factor=10.0, seed=0) -> (rc_value, p_value)`
+- **输入**：`networkx.Graph`（默认按**无向简单图**处理；有向图会自动转为无向；自环会移除）
+- **输出**：
+  - **`rc_value`**：标量 rich-clubness 分数。通常 **`rc_value > 1`** 表示比“保持度序列的随机对照网络”更强的 rich-club 结构
+  - **`p_value`**：单侧置换检验 p-value。经验判读：**`p_value < 0.05`** 表示 rich-clubness 显著高于随机对照
+
+使用示例：
+
+```python
+import networkx as nx
+from utils import get_rich_clubness
+
+G = nx.karate_club_graph()
+rc, p = get_rich_clubness(G, n_random=200, nswap_factor=10.0, seed=0)
+print("rich-clubness:", rc, "p-value:", p)
+```
+
+### Local Community Paradigm correlation（LCP-corr）
+
+- **函数**：`get_LCP_corr(G) -> r`
+- **定义**：对每条真实边 \((u, v)\)，计算
+  - **CN**：共同邻居数 \(|N(u) \cap N(v)|\)
+  - **LCL**：共同邻居诱导子图中的边数
+  然后在所有 **CN > 0** 的边样本上计算 CN 与 LCL 的 Pearson 相关系数
+- **输出**：**`r`**（范围约为 \([-1, 1]\)）。`r` 越大且为正，表示网络越符合 “Local Community Paradigm”（共同邻居越多时，其内部也越倾向形成更紧密的连接）
+- **异常情况**：若有效样本数不足（例如几乎没有三角/局部团结构），返回 `NaN`
+
+使用示例：
+
+```python
+import networkx as nx
+from utils import get_LCP_corr
+
+G = nx.karate_club_graph()
+r = get_LCP_corr(G)
+print("LCP-corr:", r)
+```
+
 ## 批量对齐（`src/align_all.py`）
 
 ```bash
